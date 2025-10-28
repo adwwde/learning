@@ -1,0 +1,502 @@
+// =============================================
+// 台风影响城市可视化系统 - 修正数值计算问题（已修复feature.get错误）
+// =============================================
+
+// 1. 加载台风数据
+var typhoonData = ee.FeatureCollection('projects/typhoon-475407/assets/all_typhoon_impacts_combined');
+
+// 2. 使用GEE内置的中国边界数据
+var chinaBoundary = ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017')
+  .filter(ee.Filter.eq('country_co', 'CH'));
+
+// 3. 数据预处理 - 基于实际数据结构（修正：统一year为字符串，避免筛选错误）
+function preprocessData() {
+  return typhoonData.map(function(feature) {
+    // 解析数值字段
+    var windSpeed = ee.Number.parse(feature.get('wind_speed'));
+    var intensityCode = ee.Number.parse(feature.get('intensity_code'));
+    var pressure = ee.Number.parse(feature.get('pressure'));
+    var lat = ee.Number.parse(feature.get('impact_latitude'));
+    var lon = ee.Number.parse(feature.get('impact_longitude'));
+    // 关键：将year转为字符串，与年度筛选器选项类型一致
+    var year = ee.String(feature.get('year'));
+    
+    // 使用处理后的城市名称
+    var cityName = ee.String(feature.get('city_name_processed'));
+    var originalCityName = ee.String(feature.get('city_name'));
+    
+    // 创建几何点
+    var point = ee.Geometry.Point([lon, lat]);
+    
+    return ee.Feature(point, {
+      'unique_id': feature.get('unique_id'),
+      'typhoon_id': feature.get('typhoon_id'),
+      'typhoon_name': feature.get('typhoon_name'),
+      'province': feature.get('province'),
+      'city_name': cityName,
+      'original_city_name': originalCityName,
+      'impact_time': feature.get('impact_time'),
+      'wind_speed': windSpeed,
+      'pressure': pressure,
+      'intensity_code': intensityCode,
+      'intensity_level': feature.get('intensity_level'),
+      'track_point_index': ee.Number.parse(feature.get('track_point_index')),
+      'impact_type': feature.get('impact_type'),
+      'sequence_in_city': ee.Number.parse(feature.get('sequence_in_city')),
+      'year': year
+    });
+  });
+}
+
+// 4. 按城市统计台风影响次数（逻辑正确，无需修改）
+function getCityImpactStats() {
+  var processedData = preprocessData();
+  
+  // 按城市分组统计 - 每个台风对每个城市只算一次
+  var cityStats = processedData
+    .distinct(['typhoon_id', 'city_name'])
+    .aggregate_array('city_name')
+    .distinct()
+    .map(function(cityName) {
+      var cityRecords = processedData.filter(ee.Filter.eq('city_name', cityName));
+      var typhoonCount = cityRecords.distinct('typhoon_id').size();
+      var firstRecord = cityRecords.first();
+      var maxWindSpeed = cityRecords.aggregate_max('wind_speed');
+      var avgIntensity = cityRecords.aggregate_mean('intensity_code');
+      
+      // 获取影响该城市的所有台风名称
+      var typhoonNames = cityRecords
+        .distinct('typhoon_id')
+        .aggregate_array('typhoon_name');
+      
+      // 创建显示信息
+      var displayInfo = ee.String('城市: ').cat(cityName)
+        .cat('\n影响次数: ').cat(ee.Number(typhoonCount).format())
+        .cat('\n最大风速: ').cat(ee.Number(maxWindSpeed).toInt().format())
+        .cat(' m/s')
+        .cat('\n平均强度: ').cat(ee.Number(avgIntensity).format())
+        .cat(' 级')
+        .cat('\n影响台风: ').cat(typhoonNames.slice(0, 3).join(', '));
+      
+      return ee.Feature(firstRecord.geometry(), {
+        'city_name': cityName,
+        'original_city_name': firstRecord.get('original_city_name'),
+        'impact_count': typhoonCount,
+        'max_wind_speed': maxWindSpeed,
+        'avg_intensity': avgIntensity,
+        'typhoon_names': typhoonNames,
+        'display_info': displayInfo,
+        'total_records': cityRecords.size()
+      });
+    });
+  
+  return ee.FeatureCollection(cityStats);
+}
+
+// 5. 可视化城市影响热力图 - 适配130个城市数据分布
+function visualizeCityImpacts() {
+  var cityStats = getCityImpactStats();
+  
+  print('=== 城市影响统计 ===');
+  print('总城市数量:', cityStats.size());
+  
+  // 输出影响次数分布（帮你后续微调色阶）
+  var impactCountStats = cityStats.aggregate_histogram('impact_count');
+  print('各影响次数的城市数量分布:', impactCountStats);
+  
+  // 核心：基于130个城市的实际分布，设计5级色阶
+  var styledCities = cityStats.map(function(feature) {
+    var impactCount = ee.Number(feature.get('impact_count'));
+    var maxWind = ee.Number(feature.get('max_wind_speed'));
+    
+    // 按影响次数分配颜色，区分度拉满
+    var color = ee.Algorithms.If(impactCount.gte(9), '#800080', // 暗紫色-9次及以上
+                   ee.Algorithms.If(impactCount.gte(6), '#DC143C', // 深红色-6-8次
+                   ee.Algorithms.If(impactCount.gte(4), '#FF6347', // 橙红色-4-5次
+                   ee.Algorithms.If(impactCount.gte(2), '#FFA500', // 橙色-2-3次
+                   '#FFFACD')))); // 淡金色-1次
+    
+    // 点大小：结合风速，让“影响次数+风速”双重区分
+    var pointSize = ee.Algorithms.If(maxWind.gt(30), 22, // 强台风（如38m/s）
+                       ee.Algorithms.If(maxWind.gt(20), 18, // 台风/强热带风暴
+                       ee.Algorithms.If(maxWind.gt(12), 14, // 热带风暴
+                       10))); // 热带低压/减弱低压
+    
+    return feature.set('style', {
+      'color': color,
+      'pointSize': pointSize,
+      'pointShape': 'circle',
+      'fillColor': color + 'A0', // 半透明填充（避免沿海密集城市遮挡）
+      'fillOpacity': 0.8
+    });
+  });
+  
+  Map.addLayer(styledCities.style({styleProperty: 'style'}), {}, '城市台风影响热力图');
+  
+  // 显示影响最严重的15个城市（方便查看高影响城市）
+  var topCities = cityStats
+    .sort('impact_count', false)
+    .limit(15);
+  
+  print('影响最严重的15个城市:');
+  topCities.evaluate(function(cities) {
+    if (cities && cities.features) {
+      for (var i = 0; i < cities.features.length; i++) {
+        var city = cities.features[i];
+        print((i + 1) + '. ' + city.properties.city_name + 
+              ': ' + city.properties.impact_count + ' 次影响 | 最大风速: ' + city.properties.max_wind_speed + ' m/s');
+      }
+    }
+  });
+  
+  return styledCities;
+}
+
+// 6. 添加点击交互功能（关键修正：ee.List用size()遍历，不用length()）
+function addClickInteraction(cityLayer) {
+  Map.onClick(function(coords, leafletEvent) {
+    var point = ee.Geometry.Point([coords.lon, coords.lat]);
+    var buffer = point.buffer(50000); // 50公里范围
+    
+    var citiesInBuffer = cityLayer.filterBounds(buffer);
+    
+    var nearestCity = citiesInBuffer
+      .map(function(feature) {
+        var distance = feature.distance(point);
+        return feature.set('distance', distance);
+      })
+      .sort('distance')
+      .first();
+    
+    nearestCity.evaluate(function(city) {
+      if (city && city.properties) {
+        // 关键修正：ee.List获取长度用size()，不是length()
+        var existingPanels = Map.getWidgets();
+        for (var i = 0; i < existingPanels.size(); i++) {
+          var widget = existingPanels.get(i);
+          if (widget.getPosition && widget.getPosition() === 'bottom-right') {
+            Map.remove(widget);
+          }
+        }
+        
+        var panel = ui.Panel({
+          style: {
+            position: 'bottom-right',
+            padding: '15px',
+            backgroundColor: 'white',
+            border: '3px solid #FF6B6B',
+            maxWidth: '500px',
+            fontSize: '14px'
+          }
+        });
+        
+        var info = ui.Label({
+          value: city.properties.display_info,
+          style: {
+            fontSize: '14px',
+            fontWeight: 'bold',
+            whiteSpace: 'pre-line',
+            lineHeight: '1.5'
+          }
+        });
+        
+        var detailButton = ui.Button({
+          label: '查看详细台风记录',
+          onClick: function() {
+            showCityDetailedRecords(city.properties.city_name);
+          },
+          style: {
+            margin: '10px 0px 0px 0px',
+            padding: '8px 16px',
+            backgroundColor: '#FF6B6B',
+            color: 'white',
+            fontWeight: 'bold'
+          }
+        });
+        
+        panel.add(info);
+        panel.add(detailButton);
+        Map.add(panel);
+      }
+    });
+  });
+}
+
+// 7. 显示城市详细台风记录（逻辑正确，无需修改）
+function showCityDetailedRecords(cityName) {
+  var processedData = preprocessData();
+  var cityRecords = processedData.filter(ee.Filter.eq('city_name', cityName));
+  
+  print('=== ' + cityName + ' 详细台风记录 ===');
+  
+  // 按台风分组显示详细信息
+  var typhoonGroups = cityRecords.distinct('typhoon_id');
+  
+  typhoonGroups.aggregate_array('typhoon_id').evaluate(function(typhoonIds) {
+    if (typhoonIds && typhoonIds.length > 0) {
+      // 使用传统循环处理每个台风
+      var processNextTyphoon = function(index) {
+        if (index >= typhoonIds.length) return;
+        
+        var typhoonId = typhoonIds[index];
+        var typhoonRecords = cityRecords.filter(ee.Filter.eq('typhoon_id', typhoonId));
+        
+        typhoonRecords.limit(1).evaluate(function(records) {
+          if (records.features && records.features.length > 0) {
+            var record = records.features[0].properties;
+            
+            // 获取该台风在该城市的统计
+            typhoonRecords.aggregate_max('wind_speed').evaluate(function(maxWind) {
+              typhoonRecords.aggregate_array('intensity_level').evaluate(function(intensities) {
+                // 去重强度等级
+                var uniqueIntensities = [];
+                var seen = {};
+                for (var j = 0; j < intensities.length; j++) {
+                  var level = intensities[j];
+                  if (!seen[level]) {
+                    seen[level] = true;
+                    uniqueIntensities.push(level);
+                  }
+                }
+                
+                print((index + 1) + '. 台风: ' + record.typhoon_name + ' (' + typhoonId + ')');
+                print('   最大风速: ' + maxWind + ' m/s');
+                print('   强度等级: ' + uniqueIntensities.join(', '));
+                print('   影响时间: ' + record.impact_time);
+                print('   记录次数: ' + intensities.length);
+                print('   ---');
+                
+                // 处理下一个台风
+                processNextTyphoon(index + 1);
+              });
+            });
+          } else {
+            // 处理下一个台风
+            processNextTyphoon(index + 1);
+          }
+        });
+      };
+      
+      // 开始处理第一个台风
+      processNextTyphoon(0);
+      
+    } else {
+      print('未找到该城市的台风记录');
+    }
+  });
+}
+
+// 8. 年度分析功能（逻辑正确，无需修改）
+function addYearlyAnalysis() {
+  var yearPanel = ui.Panel({
+    style: {
+      position: 'top-right',
+      padding: '12px',
+      backgroundColor: 'white',
+      border: '2px solid #4CAF50'
+    }
+  });
+  
+  yearPanel.add(ui.Label('年度筛选', {
+    fontWeight: 'bold',
+    fontSize: '16px',
+    margin: '0px 0px 10px 0px',
+    color: '#4CAF50'
+  }));
+  
+  var yearSelector = ui.Select({
+    items: ['全部年份', '2020', '2021', '2022', '2023', '2024'],
+    onChange: function(selectedYear) {
+      Map.layers().reset();
+      if (selectedYear === '全部年份') {
+        var cityLayer = visualizeCityImpacts();
+        addClickInteraction(cityLayer);
+      } else {
+        visualizeYearlyImpacts(selectedYear);
+      }
+      Map.addLayer(chinaBoundary, {color: 'gray', fillColor: '00000000', width: 2}, '中国边界');
+    },
+    style: {width: '120px'}
+  });
+  
+  yearPanel.add(yearSelector);
+  Map.add(yearPanel);
+}
+
+// 9. 年度特定可视化（关键修正：List转Feature后再调用map）
+function visualizeYearlyImpacts(year) {
+  var processedData = preprocessData();
+  // 筛选时使用字符串类型year，与preprocessData输出一致
+  var yearlyData = processedData.filter(ee.Filter.eq('year', year));
+  
+  // 生成年度城市统计List
+  var yearlyCityStatsList = yearlyData
+    .distinct(['typhoon_id', 'city_name'])
+    .aggregate_array('city_name')
+    .distinct()
+    .map(function(cityName) {
+      var cityRecords = yearlyData.filter(ee.Filter.eq('city_name', cityName));
+      var typhoonCount = cityRecords.distinct('typhoon_id').size();
+      var firstRecord = cityRecords.first();
+      var maxWindSpeed = cityRecords.aggregate_max('wind_speed');
+      
+      return ee.Feature(firstRecord.geometry(), {
+        'city_name': cityName,
+        'impact_count': typhoonCount,
+        'max_wind_speed': maxWindSpeed,
+        'year': year
+      });
+    });
+  
+  // 关键修正：先将List转为FeatureCollection，再调用map（避免feature.get错误）
+  var yearlyCityStats = ee.FeatureCollection(yearlyCityStatsList);
+  
+  // 为年度数据设置样式
+  var styled = yearlyCityStats.map(function(feature) {
+    var impactCount = ee.Number(feature.get('impact_count'));
+    var maxWind = ee.Number(feature.get('max_wind_speed'));
+    
+    // 简化的点大小设置
+    var pointSize = ee.Algorithms.If(maxWind.gt(30), 20,
+                       ee.Algorithms.If(maxWind.gt(20), 15,
+                       ee.Algorithms.If(maxWind.gt(10), 10,
+                       5)));
+    
+    return feature.set('style', {
+      'color': 'FF0000',
+      'pointSize': pointSize
+    });
+  });
+  
+  Map.addLayer(styled.style({styleProperty: 'style'}), {}, year + '年台风影响');
+  
+  // 关键修正：统计城市数量时用FeatureCollection的size()
+  print(year + '年影响统计:');
+  print('影响城市数量:', yearlyCityStats.size());
+  print('总记录数:', yearlyData.size());
+}
+
+// 10. 添加图例 - 适配新色阶，清晰说明
+function addLegend() {
+  var legend = ui.Panel({
+    style: {
+      position: 'bottom-left',
+      padding: '15px',
+      backgroundColor: 'white',
+      border: '2px solid #2196F3',
+      maxWidth: '280px' // 适配图例文字长度
+    }
+  });
+  
+  legend.add(ui.Label('台风影响热力图例', {
+    fontWeight: 'bold', 
+    fontSize: '18px',
+    margin: '0px 0px 10px 0px',
+    color: '#2196F3'
+  }));
+  
+  // 与色阶一一对应，标注明确的影响次数范围
+  legend.add(ui.Label('🟣 暗紫色: 影响9次及以上', {
+    color: '#800080', 
+    margin: '5px 0px',
+    fontSize: '14px'
+  }));
+  legend.add(ui.Label('🔴 深红色: 影响6-8次', {
+    color: '#DC143C',
+    margin: '5px 0px',
+    fontSize: '14px'
+  }));
+  legend.add(ui.Label('🟠 橙红色: 影响4-5次', {
+    color: '#FF6347',
+    margin: '5px 0px',
+    fontSize: '14px'
+  }));
+  legend.add(ui.Label('🟡 橙色: 影响2-3次', {
+    color: '#FFA500',
+    margin: '5px 0px',
+    fontSize: '14px'
+  }));
+  legend.add(ui.Label('⚪ 淡金色: 影响1次', {
+    color: '#FFFACD',
+    margin: '5px 0px',
+    fontSize: '14px'
+  }));
+  
+  // 补充点大小说明
+  legend.add(ui.Label('● 点大小说明:', {
+    margin: '12px 0px 5px 0px',
+    fontWeight: 'bold',
+    fontSize: '14px'
+  }));
+  legend.add(ui.Label('  22px: 风速>30m/s（强台风）', {
+    margin: '2px 0px 0px 15px',
+    fontSize: '13px'
+  }));
+  legend.add(ui.Label('  18px: 风速12-30m/s（台风/热带风暴）', {
+    margin: '2px 0px 0px 15px',
+    fontSize: '13px'
+  }));
+  legend.add(ui.Label('  10px: 风速≤12m/s（热带低压）', {
+    margin: '2px 0px 0px 15px',
+    fontSize: '13px'
+  }));
+  
+  legend.add(ui.Label('💡 点击城市查看详细台风记录', {
+    margin: '12px 0px 0px 0px', 
+    fontStyle: 'italic',
+    fontSize: '12px',
+    color: '#666'
+  }));
+  
+  Map.add(legend);
+}
+
+// 11. 数据验证和统计（逻辑正确，无需修改）
+function validateData() {
+  var processed = preprocessData();
+  
+  print('=== 数据验证结果 ===');
+  print('总记录数:', processed.size());
+  print('涉及台风数量:', processed.aggregate_array('typhoon_id').distinct().size());
+  print('涉及城市数量:', processed.aggregate_array('city_name').distinct().size());
+  print('数据年份:', processed.aggregate_array('year').distinct().sort());
+  
+  // 强度等级分布
+  var intensityStats = processed.aggregate_histogram('intensity_level');
+  print('强度等级分布:', intensityStats);
+  
+  // 省份统计
+  var provinceStats = processed.distinct(['typhoon_id', 'province']).aggregate_histogram('province');
+  print('各省影响台风数量:', provinceStats);
+}
+
+// 12. 主程序（逻辑正确，无需修改）
+function main() {
+  // 设置地图中心
+  Map.setCenter(115, 30, 4);
+  
+  // 添加中国边界
+  Map.addLayer(chinaBoundary, {
+    color: 'gray',
+    fillColor: '00000000',
+    width: 2
+  }, '中国边界');
+  
+  // 数据验证
+  validateData();
+  
+  // 可视化城市影响
+  var cityLayer = visualizeCityImpacts();
+  
+  // 添加交互功能
+  addClickInteraction(cityLayer);
+  
+  // 添加年度分析
+  addYearlyAnalysis();
+  
+  // 添加图例
+  addLegend();
+}
+
+// 运行主程序
+main();
